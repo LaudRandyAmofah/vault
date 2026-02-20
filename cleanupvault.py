@@ -1,175 +1,136 @@
-import io
-import numpy as np
+import streamlit as st
 import pandas as pd
-import plotly.express as px
 import seaborn as sns
 import matplotlib.pyplot as plt
-import streamlit as st
+import plotly.express as px
 
-st.set_page_config(layout="wide")
-st.title("Cleanup Vault (Optimized)")
+st.title("Cleanup Vault")
 
-# ---------- Helpers & Caching ----------
-@st.cache_data(show_spinner=False)
-def load_df(uploaded):
-    if uploaded.name.endswith(".csv"):
-        # Try PyArrow if present; fallback to default
-        try:
-            return pd.read_csv(uploaded, engine="pyarrow")
-        except Exception:
-            return pd.read_csv(uploaded)
+st.markdown("Upload CSV or Excel files to detect issues and get a cleaned version.")
+
+# ────────────────────────────────────────────────
+# File uploader
+# ────────────────────────────────────────────────
+uploaded = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
+
+if uploaded is not None:
+    with st.spinner("Loading file..."):
+        if uploaded.name.endswith(".csv"):
+            df = pd.read_csv(uploaded)
+        else:
+            df = pd.read_excel(uploaded)
+
+    # Basic info
+    st.subheader("File Info")
+    st.write(f"Rows: **{len(df):,}** | Columns: **{len(df.columns)}**")
+
+    # Show preview (limited rows)
+    st.subheader("Data Preview (first 500 rows)")
+    st.dataframe(df.head(500))
+
+    # ────────────────────────────────────────────────
+    # Cached sampling function for visualizations
+    # ────────────────────────────────────────────────
+    @st.cache_data(show_spinner="Preparing visualization sample...")
+    def get_sample_for_viz(_df, max_rows=20000):
+        if len(_df) > max_rows:
+            return _df.sample(max_rows, random_state=42)
+        return _df
+
+    # ────────────────────────────────────────────────
+    # Boxplot – only on sample
+    # ────────────────────────────────────────────────
+    numeric_cols = df.select_dtypes(include='number').columns.tolist()
+
+    if numeric_cols:
+        st.subheader("Boxplots of numeric columns (sampled data)")
+        sample_df = get_sample_for_viz(df)
+        fig_box = px.box(sample_df, y=numeric_cols, points="outliers", title="Boxplot – sample of up to 20,000 rows")
+        st.plotly_chart(fig_box, use_container_width=True)
     else:
-        # openpyxl is included in requirements
-        return pd.read_excel(uploaded)
+        st.info("No numeric columns found → no boxplots available.")
 
-@st.cache_data(show_spinner=True)
-def summarize_missing(df):
-    miss_cnt = df.isna().sum()
-    miss_pct = (miss_cnt / len(df) * 100).round(2)
-    miss = pd.DataFrame({"column": df.columns,
-                         "missing_count": miss_cnt.values,
-                         "missing_pct": miss_pct.values})
-    return miss
+    # ────────────────────────────────────────────────
+    # Analyze button + heavy computation
+    # ────────────────────────────────────────────────
+    if st.button("Analyze Issues & Clean Data", type="primary"):
+        with st.spinner("Analyzing data... this may take a while on large files"):
+            # Missing values
+            missing_rows = df[df.isnull().any(axis=1)].copy()
+            if not missing_rows.empty:
+                missing_rows['Issue'] = 'Missing value'
 
-@st.cache_data(show_spinner=True)
-def analyze_issues(df, numeric_cols):
-    """Return issues_df (long), clean_df (same columns), and index sets."""
-    n = len(df)
-    # --- Missing rows ---
-    missing_mask = df.isnull().any(axis=1)
-    missing_idx = set(df.index[missing_mask].tolist())
-
-    # --- Outliers via IQR (vectorized per column into index sets) ---
-    outlier_idx = set()
-    for col in numeric_cols:
-        col_series = df[col]
-        Q1, Q3 = col_series.quantile([0.25, 0.75])
-        iqr = Q3 - Q1
-        if pd.isna(iqr) or iqr == 0:
-            continue
-        mask = (col_series < Q1 - 1.5 * iqr) | (col_series > Q3 + 1.5 * iqr)
-        if mask.any():
-            outlier_idx.update(df.index[mask].tolist())
-
-    # --- Anomalies: negative numeric values ---
-    negative_idx = set()
-    for col in numeric_cols:
-        mask = df[col] < 0
-        if mask.any():
-            negative_idx.update(df.index[mask].tolist())
-
-    # --- Build issues table only once (avoid repeated concatenations) ---
-    issues_records = []
-    if missing_idx:
-        for i in missing_idx:
-            row = df.loc[i]
-            issues_records.append({**row.to_dict(), "Issue": "Missing value"})
-    if outlier_idx:
-        # For outliers, store column list for that row to reduce rowsize expansion
-        for i in outlier_idx:
-            # Identify which columns tripped (optional detail)
-            cols = []
+            # Outliers (IQR method)
+            outliers = pd.DataFrame()
             for col in numeric_cols:
                 Q1, Q3 = df[col].quantile([0.25, 0.75])
                 iqr = Q3 - Q1
-                if pd.isna(iqr) or iqr == 0: 
-                    continue
-                val = df.at[i, col]
-                if pd.notna(val) and (val < Q1 - 1.5 * iqr or val > Q3 + 1.5 * iqr):
-                    cols.append(col)
-            row = df.loc[i]
-            issues_records.append({**row.to_dict(), "Issue": f"Outlier in {', '.join(cols) if cols else 'numeric cols'}"})
-    if negative_idx:
-        for i in negative_idx:
-            cols = [c for c in numeric_cols if pd.notna(df.at[i, c]) and df.at[i, c] < 0]
-            row = df.loc[i]
-            issues_records.append({**row.to_dict(), "Issue": f"Negative value in {', '.join(cols) if cols else 'numeric cols'}"})
+                mask = (df[col] < Q1 - 1.5 * iqr) | (df[col] > Q3 + 1.5 * iqr)
+                temp = df[mask].copy()
+                if not temp.empty:
+                    temp['Issue'] = f'Outlier in {col}'
+                    outliers = pd.concat([outliers, temp], ignore_index=True)
 
-    issues_df = pd.DataFrame(issues_records) if issues_records else pd.DataFrame()
+            # Negative values in numeric columns
+            anomalies = pd.DataFrame()
+            for col in numeric_cols:
+                mask = df[col] < 0
+                temp = df[mask].copy()
+                if not temp.empty:
+                    temp['Issue'] = f'Negative value in {col}'
+                    anomalies = pd.concat([anomalies, temp], ignore_index=True)
 
-    # --- Cleaned data (drop unique indices) ---
-    to_drop = missing_idx.union(outlier_idx).union(negative_idx)
-    if to_drop:
-        clean_df = df.drop(index=list(to_drop))
-    else:
-        clean_df = df.copy()
-
-    return issues_df, clean_df, (missing_idx, outlier_idx, negative_idx)
-
-def to_csv_bytes(df: pd.DataFrame) -> io.BytesIO:
-    buf = io.BytesIO()
-    buf.write(df.to_csv(index=False).encode("utf-8"))
-    buf.seek(0)
-    return buf
-
-# ---------- UI ----------
-uploaded = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
-
-if uploaded:
-    with st.spinner("Loading data..."):
-        df = load_df(uploaded)
-
-    st.subheader("Raw Data Preview")
-    st.caption(f"{len(df):,} rows × {len(df.columns)} columns")
-    st.dataframe(df.head(200), use_container_width=True)  # show only a slice
-
-    numeric_cols = df.select_dtypes(include="number").columns.tolist()
-
-    # ----- Visualizations -----
-    st.subheader("Quick Visuals")
-
-    cols_viz = st.columns(2)
-    with cols_viz[0]:
-        # Missing summary chart (fast + scalable)
-        miss = summarize_missing(df)
-        miss_nonzero = miss[miss["missing_count"] > 0]
-        if not miss_nonzero.empty:
-            fig_miss = px.bar(
-                miss_nonzero.sort_values("missing_pct", ascending=False),
-                x="column", y="missing_pct",
-                title="Missing Values (%) by Column"
-            )
-            st.plotly_chart(fig_miss, use_container_width=True)
-        else:
-            st.write("No missing values detected.")
-
-    with cols_viz[1]:
-        # Boxplot on sample for large datasets to avoid heavy rendering
-        if numeric_cols:
-            if len(df) > 30000:
-                samp = df[numeric_cols].sample(30000, random_state=42)
-                st.caption("Showing boxplots on a 30k-row sample for performance.")
-                fig_box = px.box(samp, y=numeric_cols, points=False)
+            # Combine all issues
+            dfs_to_concat = [df_part for df_part in [missing_rows, outliers, anomalies] if not df_part.empty]
+            if dfs_to_concat:
+                issues_df = pd.concat(dfs_to_concat, ignore_index=True)
             else:
-                fig_box = px.box(df, y=numeric_cols, points=False)
-            st.plotly_chart(fig_box, use_container_width=True)
+                issues_df = pd.DataFrame()
+
+            # Create cleaned version
+            clean_df = df.copy()
+            if not missing_rows.empty:
+                clean_df = clean_df.drop(missing_rows.index, errors='ignore')
+            if not outliers.empty or not anomalies.empty:
+                bad_idx = pd.concat([outliers, anomalies]).index
+                clean_df = clean_df.drop(bad_idx, errors='ignore')
+
+        # ────────────────────────────────────────────────
+        # Results
+        # ────────────────────────────────────────────────
+        st.success("Analysis complete!")
+
+        st.subheader("Detected Issues")
+        if issues_df.empty:
+            st.success("No issues found!")
         else:
-            st.write("No numeric columns found.")
+            st.write(f"Found **{len(issues_df):,}** problematic rows")
+            # Show only head + option to download full
+            st.dataframe(issues_df.head(1000))
+            if len(issues_df) > 1000:
+                st.info(f"Showing first 1,000 rows of {len(issues_df):,} total issues")
 
-    # ----- Analyze button -----
-    if st.button("Analyze Issues", type="primary"):
-        with st.spinner("Analyzing (cached on repeat runs)..."):
-            issues_df, clean_df, _ = analyze_issues(df, numeric_cols)
+        st.subheader("Cleaned Data Preview")
+        st.dataframe(clean_df.head(500))
+        if len(clean_df) < len(df):
+            st.write(f"Rows reduced from **{len(df):,}** → **{len(clean_df):,}**")
 
-        st.subheader("Issues Table")
-        if not issues_df.empty:
-            st.dataframe(issues_df.head(500), use_container_width=True)  # cap rows in UI
+        # ────────────────────────────────────────────────
+        # Download buttons
+        # ────────────────────────────────────────────────
+        col1, col2 = st.columns(2)
+        with col1:
             st.download_button(
-                "Download Full Issues CSV",
-                data=to_csv_bytes(issues_df),
-                file_name="issues_report.csv",
-                mime="text/csv",
-                use_container_width=True
+                label="Download Cleaned CSV",
+                data=clean_df.to_csv(index=False).encode('utf-8'),
+                file_name="cleaned_data.csv",
+                mime="text/csv"
             )
-        else:
-            st.success("No issues found.")
-
-        st.subheader("Cleaned Data (preview)")
-        st.dataframe(clean_df.head(500), use_container_width=True)
-        st.download_button(
-            "Download Cleaned CSV",
-            data=to_csv_bytes(clean_df),
-            file_name="cleaned_data.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
+        with col2:
+            if not issues_df.empty:
+                st.download_button(
+                    label="Download Issues Report CSV",
+                    data=issues_df.to_csv(index=False).encode('utf-8'),
+                    file_name="issues_report.csv",
+                    mime="text/csv"
+                )
