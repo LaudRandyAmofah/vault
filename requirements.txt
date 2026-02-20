@@ -1,0 +1,6 @@
+streamlit
+pandas
+seaborn
+matplotlib
+plotly
+openpyxl  # needed for .xlsx reading
